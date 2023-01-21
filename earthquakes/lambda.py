@@ -4,7 +4,6 @@ import http
 import os
 import http.client
 import json
-import time
 import logging
 
 module_name = 'config'
@@ -42,6 +41,12 @@ b_latitude = 38.318
 a_longitude = 26.8988
 b_longitude = 27.6612
 
+# 1000 km around Kusadasi (for tests)
+a_latitude = 35.922
+b_latitude = 39.818
+a_longitude = 24.9988
+b_longitude = 30.6612
+
 TELEGRAM_API_HOST = "api.telegram.org"
 # USGS_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson"
 
@@ -50,19 +55,24 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
-def get_updatedafter():
+def get_updatedafter(minutes=60):
     # Get current time in UTC format
     now = datetime.utcnow()
     # Subtract 5 minutes from the current time
-    updatedafter = now - timedelta(minutes=5)
+    updatedafter = now - timedelta(minutes=minutes)
     # Use isoformat() to get the time in the format required by the URL
     updatedafter_str = updatedafter.isoformat()
     return updatedafter_str
 
 
+USGS_URL = f"https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&updatedafter={get_updatedafter()}"
+
+
 def utc_to_kusadasi_time(utc_timestamp):
+    # Convert timestamp from milliseconds to seconds
+    timestamp_seconds = utc_timestamp / 1000
     # Convert timestamp to datetime object in UTC
-    date_time_utc = datetime.fromtimestamp(utc_timestamp, timezone.utc)
+    date_time_utc = datetime.fromtimestamp(timestamp_seconds, timezone.utc)
     # Create a timezone object for Eastern European Time (EET)
     eet = timezone(timedelta(hours=2))
     # Convert UTC datetime to EET datetime
@@ -70,9 +80,6 @@ def utc_to_kusadasi_time(utc_timestamp):
     # Use strftime to format the datetime object
     formatted_time = date_time_eet.strftime("%d.%m %H:%M")
     return formatted_time
-
-
-USGS_URL = f"https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&updatedafter={get_updatedafter()}"
 
 
 def fetch_and_parse_usgs_summary_url():
@@ -110,10 +117,13 @@ def fetch_and_parse_usgs_detail_url(detail_url):
     logger.info(f'detail_len: {len(data)}')
     ids = data['properties']['ids'].replace(",", "")
     img_name = f'{ids}_ciim.jpg'
-    for content in data['properties']['products']['dyfi'][0]['contents']:
-        if content == img_name:
-            url = data['properties']['products']['dyfi'][0]['contents'][content]["url"]
-            return url
+    if 'dyfi' in data['properties']['products']:
+        for content in data['properties']['products']['dyfi'][0]['contents']:
+            if content == img_name:
+                url = data['properties']['products']['dyfi'][0]['contents'][content]["url"]
+                return url
+    else:
+        return data['properties']['url']
     return None
 
 
@@ -124,33 +134,40 @@ def lambda_handler(_event, _context):
     # Check that token is not empty
     if TELEGRAM_TOKEN is not None and CHAT_ID is not None:
 
-        endpoint = f"/bot{TELEGRAM_TOKEN}/sendPhoto"
+        place, url, when, mag = fetch_and_parse_usgs_summary_url()
+        if not url:
+            return
 
-        place, jpg_url, when, mag = fetch_and_parse_usgs_summary_url()
-        logger.info(f'when: {when}, mag: {mag}, place: {place}, jpg_url: {jpg_url}')
-        if not jpg_url:
-            return {
-                'statusCode': 400,
-                'body': json.dumps('No jpg_url for this earthquake')
+        if url.endswith(".jpg"):
+            endpoint = f"/bot{TELEGRAM_TOKEN}/sendPhoto"
+            payload = {
+                'chat_id': CHAT_ID,
+                'photo': url,
+                'caption': f'{when}: Mag {mag} Place: {place}'
             }
-
-        payload = {
-            'chat_id': CHAT_ID,
-            'photo': jpg_url,
-            'caption': f'{when}: Earthquake in Kusadasi ({place}), Mag: {mag}'
-        }
-
-        headers = {'content-type': "application/json"}
-
-        # Make a POST request
-        conn.request("POST", endpoint, json.dumps(payload), headers)
-
+            logger.info(f'endpoint: {endpoint}')
+            logger.info(f'payload (image): {payload}')
+            headers = {'content-type': "application/json"}
+            conn.request("POST", endpoint, json.dumps(payload), headers)
+        else:
+            endpoint = f"/bot{TELEGRAM_TOKEN}/sendMessage"
+            payload = {
+                'chat_id': CHAT_ID,
+                'text': f'{when}: Mag {mag} Place: {place}. Details: {url}'
+            }
+            logger.info(f'endpoint: {endpoint}')
+            logger.info(f'payload: {payload}')
+            headers = {'content-type': "application/json"}
+            conn.request("POST", endpoint, json.dumps(payload), headers)
         # Get the request response and save it
         res = conn.getresponse()
 
-        return {
+        res = {
+            'response': res.read().decode(),
             'statusCode': res.status,
             'body': json.dumps('Lambda executed.')
         }
+        logger.info(res)
+        return res
     else:
         raise EnvironmentError("Missing TELEGRAM_TOKEN or CHAT_ID env variable!")
